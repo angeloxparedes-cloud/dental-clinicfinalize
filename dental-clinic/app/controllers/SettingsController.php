@@ -6,8 +6,16 @@ class SettingsController {
     public function index() {
         requireLogin();
         $user_id = $_SESSION['user_id'];
-        $rows    = callProcedure('sp_get_user_by_id', [$user_id]);
-        $user    = $rows[0] ?? [];
+        $db = getDB();
+        $stmt = $db->prepare("
+            SELECT id, first_name, last_name, email, phone, role, avatar, temp_password
+            FROM users WHERE id = ?
+        ");
+        $stmt->bind_param('i', $user_id);
+        $stmt->execute();
+        $rows = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+        $stmt->close();
+        $user = $rows[0] ?? [];
         require __DIR__ . '/../views/shared/settings.php';
     }
 
@@ -23,6 +31,8 @@ class SettingsController {
         if (empty($first_name) || empty($last_name)) {
             redirect('settings', 'Name fields are required.', 'error');
         }
+
+        $db = getDB();
 
         // Handle avatar upload
         if (!empty($_FILES['avatar']['name'])) {
@@ -42,18 +52,31 @@ class SettingsController {
 
             if (move_uploaded_file($_FILES['avatar']['tmp_name'], $dest)) {
                 // Delete old avatar if exists
-                $rows = callProcedure('sp_get_user_by_id', [$user_id]);
-                $oldAvatar = $rows[0]['avatar'] ?? '';
+                $lookup = $db->prepare("SELECT avatar FROM users WHERE id = ?");
+                $lookup->bind_param('i', $user_id);
+                $lookup->execute();
+                $oldAvatar = $lookup->get_result()->fetch_assoc()['avatar'] ?? '';
+                $lookup->close();
+
                 if ($oldAvatar) {
                     $oldPath = __DIR__ . '/../../public/uploads/avatars/' . $oldAvatar;
                     if (file_exists($oldPath)) unlink($oldPath);
                 }
-                callProcedure('sp_update_avatar', [$user_id, $filename]);
+
+                $updateAvatar = $db->prepare("UPDATE users SET avatar = ? WHERE id = ?");
+                $updateAvatar->bind_param('si', $filename, $user_id);
+                $updateAvatar->execute();
+                $updateAvatar->close();
+
                 $_SESSION['avatar'] = $filename;
             }
         }
 
-        callProcedure('sp_update_profile', [$user_id, $first_name, $last_name, $phone]);
+        $stmt = $db->prepare("UPDATE users SET first_name = ?, last_name = ?, phone = ? WHERE id = ?");
+        $stmt->bind_param('sssi', $first_name, $last_name, $phone, $user_id);
+        $stmt->execute();
+        $stmt->close();
+
         $_SESSION['first_name'] = $first_name;
         $_SESSION['last_name']  = $last_name;
 
@@ -79,13 +102,29 @@ class SettingsController {
             redirect('settings', 'Password must be at least 8 characters.', 'error');
         }
 
-        $rows = callProcedure('sp_find_user_by_email', [$_SESSION['email']]);
+        $db = getDB();
+        $stmt = $db->prepare("
+            SELECT id, first_name, last_name, email, password, phone, role, is_verified, status
+            FROM users
+            WHERE LOWER(TRIM(email)) = LOWER(TRIM(?))
+            LIMIT 1
+        ");
+        $email = $_SESSION['email'];
+        $stmt->bind_param('s', $email);
+        $stmt->execute();
+        $rows = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+        $stmt->close();
+
         if (empty($rows) || !password_verify($current, $rows[0]['password'])) {
             redirect('settings', 'Current password is incorrect.', 'error');
         }
 
         $hashed = password_hash($new_pass, PASSWORD_BCRYPT);
-        callProcedure('sp_change_password', [$user_id, $hashed]);
+        $update = $db->prepare("UPDATE users SET password = ? WHERE id = ?");
+        $update->bind_param('si', $hashed, $user_id);
+        $update->execute();
+        $update->close();
+
         redirect('settings', 'Password changed successfully!', 'success');
     }
 }
