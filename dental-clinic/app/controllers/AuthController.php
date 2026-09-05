@@ -15,8 +15,19 @@ class AuthController {
             if (empty($email) || empty($password)) {
                 $error = 'Please fill in all fields.';
             } else {
-                $rows = callProcedure('sp_find_user_by_email', [$email]);
-                if (isset($rows['error']) || empty($rows)) {
+                $db = getDB();
+                $stmt = $db->prepare("
+                    SELECT id, first_name, last_name, email, password, phone, role, is_verified, status
+                    FROM users
+                    WHERE LOWER(TRIM(email)) = LOWER(TRIM(?))
+                    LIMIT 1
+                ");
+                $stmt->bind_param('s', $email);
+                $stmt->execute();
+                $rows = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+                $stmt->close();
+
+                if (empty($rows)) {
                     $error = 'Invalid email or password.';
                 } else {
                     $user = $rows[0];
@@ -107,13 +118,30 @@ class AuthController {
                 $error = 'Password must be at least 8 characters.';
             } else {
                 $hashed = password_hash($password, PASSWORD_BCRYPT);
-                $result = callProcedure('sp_register_patient', [$first_name, $last_name, $email, $hashed, $phone]);
-                if (isset($result['error'])) {
-                    $error = strpos($result['error'], 'Email already exists') !== false
-                        ? 'Email already registered. Please login.'
-                        : 'Registration failed. Please try again.';
+                $db = getDB();
+
+                // Mirrors sp_register_patient's duplicate-email guard
+                $check = $db->prepare("SELECT COUNT(*) AS cnt FROM users WHERE email = ?");
+                $check->bind_param('s', $email);
+                $check->execute();
+                $emailExists = $check->get_result()->fetch_assoc()['cnt'] > 0;
+                $check->close();
+
+                if ($emailExists) {
+                    $error = 'Email already registered. Please login.';
                 } else {
-                    redirect('login', 'Registration submitted! Please wait for admin approval before logging in.', 'success');
+                    $stmt = $db->prepare("
+                        INSERT INTO users (first_name, last_name, email, password, phone, role, status)
+                        VALUES (?, ?, ?, ?, ?, 'patient', 'pending')
+                    ");
+                    $stmt->bind_param('sssss', $first_name, $last_name, $email, $hashed, $phone);
+                    if ($stmt->execute()) {
+                        $stmt->close();
+                        redirect('login', 'Registration submitted! Please wait for admin approval before logging in.', 'success');
+                    } else {
+                        $stmt->close();
+                        $error = 'Registration failed. Please try again.';
+                    }
                 }
             }
         }
@@ -135,7 +163,15 @@ class AuthController {
         $_SESSION['role']       = $user['role'];
 
         // Fetch fresh data from DB to get avatar and temp_password
-        $fresh = callProcedure('sp_get_user_by_id', [$user['id']]);
+        $db = getDB();
+        $stmt = $db->prepare("
+            SELECT id, first_name, last_name, email, phone, role, avatar, temp_password
+            FROM users WHERE id = ?
+        ");
+        $stmt->bind_param('i', $user['id']);
+        $stmt->execute();
+        $fresh = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+        $stmt->close();
         $_SESSION['avatar'] = $fresh[0]['avatar'] ?? '';
     }
     // ─────────────────────────────────────────────────────────────────────────
