@@ -12,12 +12,55 @@ class AppointmentController {
         return array_values($seen);
     }
 
+    // Mirrors sp_get_patient_appointments
+    private function getPatientAppointments($patient_id) {
+        $db = getDB();
+        $stmt = $db->prepare("
+            SELECT a.id, a.appointment_date, a.appointment_time, a.status, a.notes,
+                   CONCAT(d.first_name, ' ', d.last_name) AS dentist_name,
+                   d.specialization,
+                   s.name AS service_name, s.price, s.duration_minutes
+            FROM appointments a
+            JOIN dentists d ON a.dentist_id = d.id
+            JOIN services s ON a.service_id = s.id
+            WHERE a.patient_id = ?
+            ORDER BY a.appointment_date DESC, a.appointment_time DESC
+        ");
+        $stmt->bind_param('i', $patient_id);
+        $stmt->execute();
+        $rows = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+        $stmt->close();
+        return $rows;
+    }
+
+    // Mirrors sp_get_dentists (active only)
+    private function getActiveDentists() {
+        $db = getDB();
+        $result = $db->query("
+            SELECT id, first_name, last_name, specialization, email, phone
+            FROM dentists WHERE is_active = 1
+            ORDER BY first_name
+        ");
+        return $result->fetch_all(MYSQLI_ASSOC);
+    }
+
+    // Mirrors sp_get_services (active only)
+    private function getActiveServices() {
+        $db = getDB();
+        $result = $db->query("
+            SELECT id, name, description, duration_minutes, price
+            FROM services WHERE is_active = 1
+            ORDER BY name
+        ");
+        return $result->fetch_all(MYSQLI_ASSOC);
+    }
+
     public function dashboard() {
         requirePatient();
         $patient_id   = $_SESSION['user_id'];
-        $appointments = callProcedure('sp_get_patient_appointments', [$patient_id]);
-        $dentists     = $this->deduplicateById(callProcedure('sp_get_dentists'));
-        $services     = $this->deduplicateById(callProcedure('sp_get_services'));
+        $appointments = $this->getPatientAppointments($patient_id);
+        $dentists     = $this->deduplicateById($this->getActiveDentists());
+        $services     = $this->deduplicateById($this->getActiveServices());
         require __DIR__ . '/../views/patient/dashboard.php';
     }
 
@@ -43,32 +86,43 @@ class AppointmentController {
             redirect('patient_dashboard', 'Please select a future date.', 'error');
         }
 
-        $result = callProcedure('sp_book_appointment', [$patient_id, $dentist_id, $service_id, $date, $time, $notes]);
+        $db = getDB();
 
-        if (isset($result['error'])) {
-            $msg = strpos($result['error'], 'already booked') !== false
-                ? 'That time slot is already taken. Please choose another.'
-                : 'Booking failed. Please try again.';
-            redirect('patient_dashboard', $msg, 'error');
+        // Mirrors sp_book_appointment's conflict guard
+        $check = $db->prepare("
+            SELECT COUNT(*) AS cnt FROM appointments
+            WHERE dentist_id = ? AND appointment_date = ? AND appointment_time = ?
+              AND status NOT IN ('cancelled')
+        ");
+        $check->bind_param('iss', $dentist_id, $date, $time);
+        $check->execute();
+        $slotTaken = $check->get_result()->fetch_assoc()['cnt'] > 0;
+        $check->close();
+
+        if ($slotTaken) {
+            redirect('patient_dashboard', 'That time slot is already taken. Please choose another.', 'error');
         }
 
-        // sp_book_appointment doesn't return the new row, and we don't want
-        // to touch the procedure itself, so we look up the appointment we
-        // just created (this patient/dentist/date/time combo is unique
-        // because of the "already booked" check above) and attach the
-        // tooth number to it, if one was picked in the tooth picker.
-        if ($tooth_number !== '') {
-            $db = getDB();
-            $stmt = $db->prepare("
-                UPDATE appointments
-                SET tooth_number = ?
-                WHERE patient_id = ? AND dentist_id = ? AND appointment_date = ? AND appointment_time = ?
-                ORDER BY id DESC
-                LIMIT 1
-            ");
-            $stmt->bind_param('siiss', $tooth_number, $patient_id, $dentist_id, $date, $time);
-            $stmt->execute();
+        $stmt = $db->prepare("
+            INSERT INTO appointments (patient_id, dentist_id, service_id, appointment_date, appointment_time, notes)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ");
+        $stmt->bind_param('iiisss', $patient_id, $dentist_id, $service_id, $date, $time, $notes);
+
+        if (!$stmt->execute()) {
             $stmt->close();
+            redirect('patient_dashboard', 'Booking failed. Please try again.', 'error');
+        }
+        $newAppointmentId = $db->insert_id;
+        $stmt->close();
+
+        // Attach the tooth number directly to the appointment we just
+        // created, if one was picked in the tooth picker.
+        if ($tooth_number !== '') {
+            $toothStmt = $db->prepare("UPDATE appointments SET tooth_number = ? WHERE id = ?");
+            $toothStmt->bind_param('si', $tooth_number, $newAppointmentId);
+            $toothStmt->execute();
+            $toothStmt->close();
         }
 
         redirect('patient_dashboard', 'Appointment booked successfully!', 'success');
@@ -79,7 +133,16 @@ class AppointmentController {
         $id         = (int)($_GET['id'] ?? 0);
         $patient_id = $_SESSION['user_id'];
         if (!$id) redirect('patient_dashboard', 'Invalid appointment.', 'error');
-        $result = callProcedure('sp_cancel_appointment', [$id, $patient_id]);
+
+        $db = getDB();
+        $stmt = $db->prepare("
+            UPDATE appointments SET status = 'cancelled'
+            WHERE id = ? AND patient_id = ? AND status = 'pending'
+        ");
+        $stmt->bind_param('ii', $id, $patient_id);
+        $stmt->execute();
+        $stmt->close();
+
         redirect('patient_dashboard', 'Appointment cancelled.', 'info');
     }
 
@@ -87,12 +150,12 @@ class AppointmentController {
         requirePatient();
         $patient_id   = $_SESSION['user_id'];
         $filter       = sanitize($_GET['status'] ?? '');
-        $appointments = callProcedure('sp_get_patient_appointments', [$patient_id]);
+        $appointments = $this->getPatientAppointments($patient_id);
         if ($filter) {
             $appointments = array_filter($appointments, fn($a) => $a['status'] === $filter);
         }
-        $dentists = $this->deduplicateById(callProcedure('sp_get_dentists'));
-        $services = $this->deduplicateById(callProcedure('sp_get_services'));
+        $dentists = $this->deduplicateById($this->getActiveDentists());
+        $services = $this->deduplicateById($this->getActiveServices());
         require __DIR__ . '/../views/patient/appointments.php';
     }
 
@@ -175,41 +238,61 @@ class AppointmentController {
     public function profile() {
         requirePatient();
         $patient_id = $_SESSION['user_id'];
-        $user       = callProcedure('sp_get_user_id', [$patient_id]);
-        $user       = $user[0] ?? [];
-        $appointments = callProcedure('sp_get_patient_appointments', [$patient_id]);
+        $db = getDB();
+
+        $stmt = $db->prepare("SELECT id, email, role, first_name, last_name, phone FROM users WHERE id = ? LIMIT 1");
+        $stmt->bind_param('i', $patient_id);
+        $stmt->execute();
+        $userRows = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+        $stmt->close();
+        $user = $userRows[0] ?? [];
+
+        $appointments = $this->getPatientAppointments($patient_id);
         $totalSpent = array_sum(array_map(
             fn($a) => $a['status'] === 'completed' ? (float)$a['price'] : 0,
             $appointments
         ));
         require __DIR__ . '/../views/patient/profile.php';
     }
+
     public function reschedule() {
-    requirePatient();
-    if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
-        redirect('patient_dashboard');
+        requirePatient();
+        if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+            redirect('patient_dashboard');
+        }
+
+        $patient_id     = $_SESSION['user_id'];
+        $appointment_id = (int)($_POST['appointment_id'] ?? 0);
+        $new_date       = sanitize($_POST['new_date'] ?? '');
+        $new_time       = sanitize($_POST['new_time'] ?? '');
+        $reason         = sanitize($_POST['reschedule_reason'] ?? '');
+
+        if (!$appointment_id || empty($new_date) || empty($new_time) || empty($reason)) {
+            redirect('patient_dashboard', 'Please fill in all fields including the reason.', 'error');
+        }
+
+        if (strtotime($new_date) < strtotime(date('Y-m-d'))) {
+            redirect('patient_dashboard', 'Please select a future date.', 'error');
+        }
+
+        $db = getDB();
+        $stmt = $db->prepare("
+            UPDATE appointments
+            SET original_date     = appointment_date,
+                original_time     = appointment_time,
+                appointment_date  = ?,
+                appointment_time  = ?,
+                reschedule_reason = ?,
+                rescheduled_at    = NOW(),
+                status            = 'pending'
+            WHERE id = ? AND patient_id = ? AND status IN ('pending', 'confirmed')
+        ");
+        $stmt->bind_param('sssii', $new_date, $new_time, $reason, $appointment_id, $patient_id);
+        $stmt->execute();
+        $stmt->close();
+
+        redirect('patient_dashboard', 'Appointment rescheduled successfully!', 'success');
     }
-
-    $patient_id     = $_SESSION['user_id'];
-    $appointment_id = (int)($_POST['appointment_id'] ?? 0);
-    $new_date       = sanitize($_POST['new_date'] ?? '');
-    $new_time       = sanitize($_POST['new_time'] ?? '');
-    $reason         = sanitize($_POST['reschedule_reason'] ?? '');
-
-    if (!$appointment_id || empty($new_date) || empty($new_time) || empty($reason)) {
-        redirect('patient_dashboard', 'Please fill in all fields including the reason.', 'error');
-    }
-
-    if (strtotime($new_date) < strtotime(date('Y-m-d'))) {
-        redirect('patient_dashboard', 'Please select a future date.', 'error');
-    }
-
-    callProcedure('sp_reschedule_appointment', [
-        $appointment_id, $patient_id, $new_date, $new_time, $reason
-    ]);
-
-    redirect('patient_dashboard', 'Appointment rescheduled successfully!', 'success');
-}
 
     public function feedback() {
         requirePatient();
