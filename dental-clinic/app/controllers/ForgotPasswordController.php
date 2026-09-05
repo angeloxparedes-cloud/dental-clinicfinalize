@@ -56,8 +56,22 @@ class ForgotPasswordController {
             exit;
         }
 
-        // Submit new request
-        callProcedure('sp_request_password_reset', [$email]);
+        // Submit new request — mirrors sp_request_password_reset:
+        // only insert if this patient doesn't already have a pending request
+        $userRow = $user; // already fetched above, has 'id'
+        $checkPending = $db->prepare("SELECT id FROM password_resets WHERE user_id = ? AND status = 'pending' LIMIT 1");
+        $checkPending->bind_param('i', $userRow['id']);
+        $checkPending->execute();
+        $alreadyPending = $checkPending->get_result()->fetch_assoc();
+        $checkPending->close();
+
+        if (!$alreadyPending) {
+            $insert = $db->prepare("INSERT INTO password_resets (user_id) VALUES (?)");
+            $insert->bind_param('i', $userRow['id']);
+            $insert->execute();
+            $insert->close();
+        }
+
         redirect('forgot_password', 'Request submitted! Check back here once the admin approves it.', 'success');
     }
 
@@ -82,8 +96,17 @@ class ForgotPasswordController {
         }
 
         $hashed = password_hash($password, PASSWORD_BCRYPT);
-        callProcedure('sp_change_password', [$user_id, $hashed]);
-        callProcedure('sp_use_temp_password', [$user_id]);
+        $db = getDB();
+
+        $stmt = $db->prepare("UPDATE users SET password = ? WHERE id = ?");
+        $stmt->bind_param('si', $hashed, $user_id);
+        $stmt->execute();
+        $stmt->close();
+
+        $stmt2 = $db->prepare("UPDATE users SET temp_password = NULL WHERE id = ?");
+        $stmt2->bind_param('i', $user_id);
+        $stmt2->execute();
+        $stmt2->close();
 
         unset($_SESSION['force_reset'], $_SESSION['show_temp_pass'], $_SESSION['show_temp_pass_email']);
 
