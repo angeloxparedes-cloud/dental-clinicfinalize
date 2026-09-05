@@ -6,18 +6,61 @@ class AdminController {
 
     public function dashboard() {
         requireStaffOrAdmin();
-        $stats        = callProcedure('sp_get_dashboard_stats');
-        $stats        = $stats[0] ?? [];
-        $appointments = callProcedure('sp_get_all_appointments');
-        $today        = date('Y-m-d');
+        $db = getDB();
+
+        // Mirrors sp_get_dashboard_stats
+        $statsResult = $db->query("
+            SELECT
+                (SELECT COUNT(*) FROM appointments WHERE status='pending') AS pending_count,
+                (SELECT COUNT(*) FROM appointments WHERE status='confirmed') AS confirmed_count,
+                (SELECT COUNT(*) FROM appointments WHERE status='completed') AS completed_count,
+                (SELECT COUNT(*) FROM appointments WHERE DATE(appointment_date)=CURDATE()) AS today_count,
+                (SELECT COUNT(*) FROM users WHERE role='patient') AS total_patients,
+                (SELECT COUNT(*) FROM appointments) AS total_appointments,
+                (SELECT COUNT(*) FROM payments WHERE status='pending') AS pending_payments,
+                (SELECT COALESCE(SUM(amount),0) FROM payments WHERE status='paid') AS total_revenue
+        ");
+        $stats = $statsResult->fetch_assoc() ?: [];
+
+        // Mirrors sp_get_all_appointments
+        $apptResult = $db->query("
+            SELECT a.id, a.appointment_date, a.appointment_time, a.status, a.notes,
+                   CONCAT(u.first_name, ' ', u.last_name) AS patient_name,
+                   u.email AS patient_email, u.phone AS patient_phone,
+                   CONCAT(d.first_name, ' ', d.last_name) AS dentist_name,
+                   s.name AS service_name, s.price
+            FROM appointments a
+            JOIN users u ON a.patient_id = u.id
+            JOIN dentists d ON a.dentist_id = d.id
+            JOIN services s ON a.service_id = s.id
+            ORDER BY a.appointment_date DESC, a.appointment_time DESC
+        ");
+        $appointments = $apptResult->fetch_all(MYSQLI_ASSOC);
+
+        $today = date('Y-m-d');
         $today_appointments = array_filter($appointments, fn($a) => $a['appointment_date'] === $today);
         require __DIR__ . '/../views/admin/dashboard.php';
     }
 
     public function appointments() {
         requireStaffOrAdmin();
-        $filter       = sanitize($_GET['status'] ?? '');
-        $appointments = callProcedure('sp_get_all_appointments');
+        $filter = sanitize($_GET['status'] ?? '');
+        $db = getDB();
+
+        $result = $db->query("
+            SELECT a.id, a.appointment_date, a.appointment_time, a.status, a.notes,
+                   CONCAT(u.first_name, ' ', u.last_name) AS patient_name,
+                   u.email AS patient_email, u.phone AS patient_phone,
+                   CONCAT(d.first_name, ' ', d.last_name) AS dentist_name,
+                   s.name AS service_name, s.price
+            FROM appointments a
+            JOIN users u ON a.patient_id = u.id
+            JOIN dentists d ON a.dentist_id = d.id
+            JOIN services s ON a.service_id = s.id
+            ORDER BY a.appointment_date DESC, a.appointment_time DESC
+        ");
+        $appointments = $result->fetch_all(MYSQLI_ASSOC);
+
         if ($filter) {
             $appointments = array_filter($appointments, fn($a) => $a['status'] === $filter);
         }
@@ -26,7 +69,14 @@ class AdminController {
 
     public function patients() {
         requireStaffOrAdmin();
-        $patients = callProcedure('sp_get_all_patients');
+        $db = getDB();
+        $result = $db->query("
+            SELECT id, first_name, last_name, email, phone, created_at
+            FROM users
+            WHERE role = 'patient'
+            ORDER BY created_at DESC
+        ");
+        $patients = $result->fetch_all(MYSQLI_ASSOC);
         require __DIR__ . '/../views/admin/patients.php';
     }
 
@@ -138,11 +188,14 @@ class AdminController {
         redirect('admin_appointments', 'Invalid request.', 'error');
     }
 
-    callProcedure('sp_update_appointment_status', [$id, $status]);
+    $db = getDB();
+    $stmt = $db->prepare("UPDATE appointments SET status = ? WHERE id = ?");
+    $stmt->bind_param('si', $status, $id);
+    $stmt->execute();
+    $stmt->close();
 
     // Send confirmation email only when the appointment is being confirmed
     if ($status === 'confirmed') {
-        $db = getDB();
         $stmt = $db->prepare("
             SELECT u.email, CONCAT(u.first_name,' ',u.last_name) AS patient_name,
                    a.appointment_date, a.appointment_time,
@@ -176,7 +229,12 @@ class AdminController {
 
     public function dentists() {
         requireAdmin();
-        $dentists = callProcedure('sp_get_all_dentists');
+        $db = getDB();
+        $result = $db->query("
+            SELECT id, first_name, last_name, specialization, email, phone, is_active
+            FROM dentists ORDER BY first_name
+        ");
+        $dentists = $result->fetch_all(MYSQLI_ASSOC);
         require __DIR__ . '/../views/admin/dentists.php';
     }
 
@@ -287,7 +345,16 @@ class AdminController {
         $email          = sanitize($_POST['email'] ?? '');
         $phone          = sanitize($_POST['phone'] ?? '');
         if (empty($first_name) || empty($last_name)) redirect('admin_dentists','Name is required.','error');
-        callProcedure('sp_add_dentist', [$first_name, $last_name, $specialization, $email, $phone]);
+
+        $db = getDB();
+        $stmt = $db->prepare("
+            INSERT INTO dentists (first_name, last_name, specialization, email, phone)
+            VALUES (?, ?, ?, ?, ?)
+        ");
+        $stmt->bind_param('sssss', $first_name, $last_name, $specialization, $email, $phone);
+        $stmt->execute();
+        $stmt->close();
+
         redirect('admin_dentists', 'Dentist added successfully!', 'success');
     }
 
@@ -302,7 +369,17 @@ class AdminController {
         $phone          = sanitize($_POST['phone'] ?? '');
         $is_active      = (int)($_POST['is_active'] ?? 1);
         if (!$id || empty($first_name) || empty($last_name)) redirect('admin_dentists','Invalid data.','error');
-        callProcedure('sp_update_dentist', [$id, $first_name, $last_name, $specialization, $email, $phone, $is_active]);
+
+        $db = getDB();
+        $stmt = $db->prepare("
+            UPDATE dentists
+            SET first_name=?, last_name=?, specialization=?, email=?, phone=?, is_active=?
+            WHERE id = ?
+        ");
+        $stmt->bind_param('sssssii', $first_name, $last_name, $specialization, $email, $phone, $is_active, $id);
+        $stmt->execute();
+        $stmt->close();
+
         redirect('admin_dentists', 'Dentist updated successfully!', 'success');
     }
 
@@ -310,14 +387,39 @@ class AdminController {
         requireAdmin();
         $id = (int)($_GET['id'] ?? 0);
         if (!$id) redirect('admin_dentists','Invalid dentist.','error');
-        callProcedure('sp_delete_dentist', [$id]);
+
+        $db = getDB();
+        $stmt = $db->prepare("UPDATE dentists SET is_active = 0 WHERE id = ?");
+        $stmt->bind_param('i', $id);
+        $stmt->execute();
+        $stmt->close();
+
         redirect('admin_dentists', 'Dentist deactivated.', 'info');
     }
 
     public function payments() {
         requireStaffOrAdmin();
-        $filter   = sanitize($_GET['status'] ?? '');
-        $payments = callProcedure('sp_get_all_payments');
+        $filter = sanitize($_GET['status'] ?? '');
+        $db = getDB();
+
+        $result = $db->query("
+            SELECT p.id, p.amount, p.method, p.status,
+                   p.reference_no, p.notes, p.paid_at, p.created_at,
+                   CONCAT(u.first_name,' ',u.last_name) AS patient_name,
+                   u.email AS patient_email,
+                   a.appointment_date, a.appointment_time,
+                   s.name AS service_name,
+                   CONCAT(d.first_name,' ',d.last_name) AS dentist_name,
+                   p.appointment_id
+            FROM payments p
+            JOIN users u ON p.patient_id = u.id
+            JOIN appointments a ON p.appointment_id = a.id
+            JOIN services s ON a.service_id = s.id
+            JOIN dentists d ON a.dentist_id = d.id
+            ORDER BY p.created_at DESC
+        ");
+        $payments = $result->fetch_all(MYSQLI_ASSOC);
+
         if ($filter) {
             $payments = array_filter($payments, fn($p) => $p['status'] === $filter);
         }
@@ -331,14 +433,34 @@ class AdminController {
         $notes  = sanitize($_POST['notes'] ?? '');
         $valid  = ['pending','paid','refunded'];
         if (!$id || !in_array($status, $valid)) redirect('admin_payments','Invalid request.','error');
-        callProcedure('sp_update_payment_status', [$id, $status, $notes]);
+
+        // Mirrors sp_update_payment_status: paid_at only advances when
+        // newly marking as paid, and notes only overwrite when non-empty.
+        $db = getDB();
+        $stmt = $db->prepare("
+            UPDATE payments
+            SET status = ?,
+                paid_at = IF(? = 'paid', NOW(), paid_at),
+                notes = IF(? != '', ?, notes)
+            WHERE id = ?
+        ");
+        $stmt->bind_param('ssssi', $status, $status, $notes, $notes, $id);
+        $stmt->execute();
+        $stmt->close();
+
         redirect('admin_payments', 'Payment status updated.', 'success');
     }
     public function deletePatient() {
     requireAdmin();
     $id = (int)($_GET['id'] ?? 0);
     if (!$id) redirect('admin_patients', 'Invalid patient.', 'error');
-    callProcedure('sp_delete_patient', [$id]);
+
+    $db = getDB();
+    $stmt = $db->prepare("DELETE FROM users WHERE id = ? AND role = 'patient'");
+    $stmt->bind_param('i', $id);
+    $stmt->execute();
+    $stmt->close();
+
     redirect('admin_patients', 'Patient deleted successfully.', 'success');
 }
 public function calendar() {
@@ -595,19 +717,39 @@ public function calendar() {
         redirect('pending_patients', 'Invalid action.', 'error');
     }
 
-    callProcedure('sp_update_patient_status', [$id, $action]);
+    $db = getDB();
+    $stmt = $db->prepare("UPDATE users SET status = ? WHERE id = ?");
+    $stmt->bind_param('si', $action, $id);
+    $stmt->execute();
+    $stmt->close();
+
     $msg = $action === 'approved' ? 'Patient approved successfully.' : 'Patient rejected.';
     redirect('pending_patients', $msg, 'success');
 }
 
 public function pendingPatients() {
     if (!isAdmin() && !isStaff()) redirect('login');
-    $patients = callProcedure('sp_get_pending_patients', []);
+    $db = getDB();
+    $result = $db->query("
+        SELECT id, first_name, last_name, email, phone, created_at
+        FROM users
+        WHERE role = 'patient' AND status = 'pending'
+        ORDER BY created_at DESC
+    ");
+    $patients = $result->fetch_all(MYSQLI_ASSOC);
     require __DIR__ . '/../views/admin/pending_patients.php';
 }
 public function resetRequests() {
     requireStaffOrAdmin();
-    $requests = callProcedure('sp_get_password_reset_requests', []);
+    $db = getDB();
+    $result = $db->query("
+        SELECT pr.id, u.first_name, u.last_name, u.email, u.phone, pr.created_at
+        FROM password_resets pr
+        JOIN users u ON pr.user_id = u.id
+        WHERE pr.status = 'pending'
+        ORDER BY pr.created_at DESC
+    ");
+    $requests = $result->fetch_all(MYSQLI_ASSOC);
     require __DIR__ . '/../views/admin/reset_requests.php';
 }
 
@@ -619,8 +761,22 @@ public function approveReset() {
         $temp   = 'Temp@' . rand(1000, 9999);
         $hashed = password_hash($temp, PASSWORD_BCRYPT);
  
-        // Pass plain password to procedure so patient can see it on forgot password page
-        callProcedure('sp_approve_password_reset', [$id, $hashed, $temp]);
+        // Mirrors sp_approve_password_reset: updates the user's password
+        // and marks the reset request approved in one go, keeping the
+        // plain-text temp password only in password_resets so the patient
+        // can see it on the forgot-password page.
+        $db = getDB();
+        $stmt = $db->prepare("
+            UPDATE users u
+            JOIN password_resets pr ON pr.user_id = u.id
+            SET u.password = ?,
+                pr.status  = 'approved',
+                pr.temp_password_plain = ?
+            WHERE pr.id = ?
+        ");
+        $stmt->bind_param('ssi', $hashed, $temp, $id);
+        $stmt->execute();
+        $stmt->close();
  
         redirect('admin_reset_requests', 'Approved! Temporary password generated: ' . $temp, 'success');
     }
